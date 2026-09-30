@@ -18,6 +18,11 @@ Describe the checks you ran locally.
 - [ ] Frontend build
 - [ ] Manual validation
 
+## Safety and compatibility
+
+- [ ] I considered security, privacy, and policy-enforcement impact.
+- [ ] I documented any compatibility or configuration changes.
+
 ## Notes
 
 Add anything important for the maintainer to review.

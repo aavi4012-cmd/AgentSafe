@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -51,7 +51,7 @@ def check_action(payload: ActionEvaluateRequest, db: Session = Depends(get_db)):
         policy_name=result["policy_name"],
         approval_status="required" if result["requires_approval"] else "not_required",
         execution_status="allowed" if result["decision"] == "ALLOW" else "blocked" if result["decision"] == "BLOCK" else "pending",
-        timestamp=datetime.utcnow().isoformat(timespec="seconds"),
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
     )
     db.add(action_record)
     db.commit()
@@ -65,7 +65,7 @@ def check_action(payload: ActionEvaluateRequest, db: Session = Depends(get_db)):
             reason=result["risk_factors"][0] if result["risk_factors"] else "high-risk action",
             risk_score=result["risk_score"],
             status="pending",
-            created_at=datetime.utcnow().isoformat(timespec="seconds"),
+            created_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
         )
         db.add(approval)
         db.commit()

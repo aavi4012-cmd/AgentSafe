@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertTriangle, CheckCircle2, Lock, Shield, ShieldAlert, SlidersHorizontal, LogOut, ArrowRight } from 'lucide-react';
 
 type TabKey = 'dashboard' | 'agents' | 'tools' | 'policies' | 'approvals' | 'simulator';
@@ -25,6 +25,8 @@ type Result = {
   requires_approval: boolean;
 };
 
+type SimulatorInput = { agent: string; tool: string; environment: string; argumentsText: string };
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000/api';
 
 const navItems: { id: TabKey; label: string }[] = [
@@ -49,24 +51,37 @@ const decisionClasses: Record<string, string> = {
   REQUIRE_APPROVAL: 'bg-amber-50 text-amber-700 border border-amber-200',
 };
 
+function DataState({ label, loading, error, empty }: { label: string; loading: boolean; error: Error | null; empty: boolean }) {
+  if (loading) return <p className="p-4 text-sm text-stone-500">Loading {label}…</p>;
+  if (error) return <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-4 text-sm text-rose-700">Could not load {label}: {error.message}. Check the API connection.</p>;
+  if (empty) return <p className="p-4 text-sm text-stone-500">No {label} available.</p>;
+  return null;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
   if (!res.ok) throw new Error('Request failed');
   return res.json() as Promise<T>;
 }
 
+function formatLocalTime(timestamp: string) {
+  const includesTimezone = /(?:Z|[+-]\d{2}:\d{2})$/i.test(timestamp);
+  const parsed = new Date(includesTimezone ? timestamp : `${timestamp}Z`);
+  return parsed.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
 function App() {
   const [tab, setTab] = useState<TabKey>('dashboard');
   const [simulator, setSimulator] = useState({
-    agent: 'support-agent',
-    tool: 'database.delete_user',
+    agent: '',
+    tool: '',
     environment: 'production',
     argumentsText: '{"user_id":"123"}',
   });
   const [result, setResult] = useState<Result | null>(null);
-  const [approvalRows, setApprovalRows] = useState<Approval[]>([]);
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
-  const [loginForm, setLoginForm] = useState({ email: '', password: '' });
+  const queryClient = useQueryClient();
+  const [isAuthenticated, setIsAuthenticated] = useState(true);
+  const [displayName, setDisplayName] = useState('');
   const [operatorName, setOperatorName] = useState('Operator');
   const [waitlist, setWaitlist] = useState({
     name: '',
@@ -76,41 +91,56 @@ function App() {
   });
   const [waitlistSubmitted, setWaitlistSubmitted] = useState(false);
 
-  const { data: stats, isLoading: statsLoading } = useQuery({
+  const { data: stats, isLoading: statsLoading, error: statsError } = useQuery({
     queryKey: ['stats'],
     queryFn: () => fetchJson<Stats>(`${API_BASE}/dashboard/stats`),
+    refetchInterval: 5000,
   });
 
-  const { data: actions, isLoading: actionsLoading } = useQuery({
+  const { data: actions, isLoading: actionsLoading, error: actionsError } = useQuery({
     queryKey: ['recent-actions'],
     queryFn: () => fetchJson<ActionItem[]>(`${API_BASE}/dashboard/recent-actions`),
+    refetchInterval: 5000,
   });
 
-  const { data: agents = [], isLoading: agentsLoading } = useQuery({
+  const { data: agents = [], isLoading: agentsLoading, error: agentsError } = useQuery({
     queryKey: ['agents'],
     queryFn: () => fetchJson<Agent[]>(`${API_BASE}/agents`),
+    refetchInterval: 5000,
   });
 
-  const { data: tools = [], isLoading: toolsLoading } = useQuery({
+  const { data: tools = [], isLoading: toolsLoading, error: toolsError } = useQuery({
     queryKey: ['tools'],
     queryFn: () => fetchJson<Tool[]>(`${API_BASE}/tools`),
+    refetchInterval: 5000,
   });
 
-  const { data: policies = [], isLoading: policiesLoading } = useQuery({
+  const { data: policies = [], isLoading: policiesLoading, error: policiesError } = useQuery({
     queryKey: ['policies'],
     queryFn: () => fetchJson<Policy[]>(`${API_BASE}/policies`),
+    refetchInterval: 5000,
   });
 
-  const { data: approvals = [], isLoading: approvalsLoading } = useQuery({
+  const { data: approvals = [], isLoading: approvalsLoading, error: approvalsError } = useQuery({
     queryKey: ['approvals'],
     queryFn: () => fetchJson<Approval[]>(`${API_BASE}/approvals`),
+    refetchInterval: 5000,
   });
 
-  useEffect(() => {
-    if (approvals.length) {
-      setApprovalRows(approvals);
-    }
-  }, [approvals]);
+  const approvalMutation = useMutation({
+    mutationFn: async ({ id, decision }: { id: number; decision: 'approve' | 'deny' }) => {
+      const response = await fetch(`${API_BASE}/approvals/${id}/${decision}`, { method: 'POST' });
+      if (!response.ok) throw new Error('Could not save approval decision');
+      return response.json() as Promise<Approval>;
+    },
+    onSuccess: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['approvals'] }),
+        queryClient.invalidateQueries({ queryKey: ['stats'] }),
+        queryClient.invalidateQueries({ queryKey: ['recent-actions'] }),
+      ]);
+    },
+  });
 
   useEffect(() => {
     const revealItems = document.querySelectorAll('.reveal-on-scroll');
@@ -140,13 +170,17 @@ function App() {
     ];
   }, [stats]);
 
-  const handleAnalyze = async () => {
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+
+  const handleAnalyze = async (input: SimulatorInput = simulator) => {
+    setSimulator(input);
+    setAnalysisError(null);
     try {
       const payload = {
-        agent: simulator.agent,
-        tool: simulator.tool,
-        environment: simulator.environment,
-        arguments: JSON.parse(simulator.argumentsText || '{}'),
+        agent: input.agent,
+        tool: input.tool,
+        environment: input.environment,
+        arguments: JSON.parse(input.argumentsText || '{}'),
         context: { task: 'simulator' },
       };
       const res = await fetch(`${API_BASE}/actions/check`, {
@@ -157,34 +191,24 @@ function App() {
       if (!res.ok) throw new Error('Invalid analysis result');
       const data = await res.json();
       setResult(data);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['stats'] }),
+        queryClient.invalidateQueries({ queryKey: ['recent-actions'] }),
+        queryClient.invalidateQueries({ queryKey: ['approvals'] }),
+      ]);
     } catch (error) {
-      setResult({
-        agent: simulator.agent,
-        tool: simulator.tool,
-        environment: simulator.environment,
-        risk_score: 0,
-        risk_level: 'LOW',
-        decision: 'ALLOW',
-        explanation: 'The simulator failed to parse the action. Check your JSON arguments.',
-        risk_factors: ['input validation'],
-        recommended_policy: 'Validate the simulator input before evaluating.',
-        blocked: false,
-        requires_approval: false,
-      });
+      setResult(null);
+      setAnalysisError(error instanceof Error ? error.message : 'Action analysis failed.');
     }
   };
 
-  const handleApprovalDecision = (id: number, nextStatus: 'approved' | 'denied') => {
-    setApprovalRows((current) =>
-      current.map((approval) =>
-        approval.id === id ? { ...approval, status: nextStatus } : approval,
-      ),
-    );
+  const handleApprovalDecision = (id: number, decision: 'approve' | 'deny') => {
+    approvalMutation.mutate({ id, decision });
   };
 
   const handleLogin = (event: FormEvent) => {
     event.preventDefault();
-    const name = loginForm.email.trim() || 'Operator';
+    const name = displayName.trim() || 'Operator';
     setOperatorName(name.split('@')[0] || 'Operator');
     setIsAuthenticated(true);
   };
@@ -237,31 +261,20 @@ function App() {
           <div className="p-8">
             <div className="mb-6 flex items-center justify-between">
               <div>
-                <div className="text-[10px] uppercase tracking-[0.28em] text-stone-500">Admin access</div>
-                <h2 className="mt-2 text-2xl font-semibold text-stone-800">Try the live control room</h2>
+                <div className="text-[10px] uppercase tracking-[0.28em] text-stone-500">Public demo</div>
+                  <h2 className="mt-2 text-2xl font-semibold text-stone-800">Explore the control room</h2>
               </div>
               <div className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">Open demo</div>
             </div>
 
             <form onSubmit={handleLogin} className="space-y-4">
               <label className="block">
-                <span className="mb-2 block text-sm text-stone-600">Your name or email</span>
+                <span className="mb-2 block text-sm text-stone-600">Display name</span>
                 <input
                   type="text"
-                  value={loginForm.email}
-                  onChange={(event) => setLoginForm({ ...loginForm, email: event.target.value })}
-                  placeholder="alex@startup.com"
-                  className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-3 text-stone-800 outline-none transition focus:border-stone-300"
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-2 block text-sm text-stone-600">Password</span>
-                <input
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(event) => setLoginForm({ ...loginForm, password: event.target.value })}
-                  placeholder="any password works for now"
+                  value={displayName}
+                  onChange={(event) => setDisplayName(event.target.value)}
+                  placeholder="Operator"
                   className="w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-3 text-stone-800 outline-none transition focus:border-stone-300"
                 />
               </label>
@@ -270,25 +283,15 @@ function App() {
                 type="submit"
                 className="flex w-full items-center justify-center gap-2 rounded-xl bg-stone-900 px-4 py-3 text-sm font-medium text-white transition hover:bg-stone-700"
               >
-                Enter the dashboard
+                Open demo workspace
                 <ArrowRight size={16} />
               </button>
             </form>
 
             <div className="mt-6 rounded-2xl border border-dashed border-stone-300 bg-stone-50 p-4 text-sm text-stone-600">
-              This is an early MVP for contributors and startups. Anyone can access it now while we shape the product with real feedback.
+              This public demo has no authentication and must not be used with production data.
             </div>
 
-            <div className="mt-6 flex items-center justify-between rounded-2xl border border-stone-200 p-3 text-sm text-stone-600">
-              <span>Want to contribute?</span>
-              <button
-                type="button"
-                onClick={() => setLoginForm({ email: 'contributor@agentsafe.ai', password: 'demo' })}
-                className="font-medium text-emerald-700"
-              >
-                Use contributor access
-              </button>
-            </div>
           </div>
         </div>
       </div>
@@ -297,7 +300,7 @@ function App() {
 
   return (
     <div className="min-h-screen bg-[#f6f3ee] text-slate-700">
-      <aside className="fixed inset-y-0 left-0 w-72 border-r border-stone-200 bg-[#fffdfb] p-5 shadow-[0_0_0_1px_rgba(0,0,0,0.02)]">
+      <aside className="border-b border-stone-200 bg-[#fffdfb] p-4 shadow-[0_0_0_1px_rgba(0,0,0,0.02)] lg:fixed lg:inset-y-0 lg:left-0 lg:w-72 lg:border-b-0 lg:border-r lg:p-5">
         <div className="mb-8 flex items-center gap-3">
           <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-100 text-emerald-700">
             <Shield />
@@ -309,7 +312,7 @@ function App() {
         </div>
 
         <div className="mb-5 rounded-2xl border border-stone-200 bg-stone-50 p-3">
-          <div className="text-[10px] uppercase tracking-[0.2em] text-stone-500">Signed in</div>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-stone-500">Public demo</div>
           <div className="mt-2 flex items-center justify-between">
             <span className="font-medium text-stone-800">{operatorName}</span>
             <button
@@ -318,17 +321,17 @@ function App() {
               className="flex items-center gap-1 text-xs text-stone-500 hover:text-stone-800"
             >
               <LogOut size={12} />
-              Exit
+              Exit demo
             </button>
           </div>
         </div>
 
-        <nav className="space-y-2">
+        <nav className="flex gap-2 overflow-x-auto lg:block lg:space-y-2">
           {navItems.map((item) => (
             <button
               key={item.id}
               onClick={() => setTab(item.id)}
-              className={`w-full rounded-xl px-3 py-2.5 text-left text-sm font-medium transition ${
+              className={`w-full shrink-0 rounded-xl px-3 py-2.5 text-left text-sm font-medium transition ${
                 tab === item.id ? 'bg-stone-900 text-white shadow-sm' : 'text-stone-600 hover:bg-stone-100'
               }`}
             >
@@ -346,7 +349,7 @@ function App() {
         </div>
       </aside>
 
-      <main className="ml-72 p-8">
+      <main className="min-w-0 p-4 sm:p-6 lg:ml-72 lg:p-8">
         <header className="mb-8 flex items-center justify-between">
           <div>
             <p className="text-[10px] uppercase tracking-[0.26em] text-stone-500">Traffic control for AI work</p>
@@ -354,7 +357,7 @@ function App() {
           </div>
           <div className="flex items-center gap-3">
             <div className="rounded-xl border border-emerald-200 bg-emerald-100 px-4 py-2 text-sm font-medium text-emerald-800">
-              Live overview
+              Live · 5s refresh
             </div>
             <div className="rounded-xl border border-stone-200 bg-white px-3 py-2 text-sm text-stone-600">
               Operator: {operatorName}
@@ -362,6 +365,7 @@ function App() {
           </div>
         </header>
 
+        <div className="hidden">
         <section className="reveal-on-scroll mb-6 rounded-3xl border border-stone-200 bg-gradient-to-r from-[#f8f3ee] via-[#f3efe8] to-[#e6f5ee] p-6 text-stone-800 shadow-[0_18px_40px_rgba(12,18,24,0.08)]">
           <div className="mb-2 text-[10px] uppercase tracking-[0.28em] text-emerald-700">Built for people shipping AI</div>
           <h2 className="max-w-2xl text-2xl font-semibold leading-tight text-stone-900">
@@ -657,9 +661,11 @@ function App() {
             </div>
           ))}
         </section>
+        </div>
 
         {tab === 'dashboard' && (
           <>
+            <DataState label="dashboard stats" loading={statsLoading} error={statsError} empty={!stats} />
             <section className="mb-6 grid gap-4 md:grid-cols-3">
               <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                 <div className="mb-2 flex items-center gap-3">
@@ -706,6 +712,23 @@ function App() {
                   <span className="text-[10px] uppercase tracking-[0.22em] text-emerald-700">Audit</span>
                 </div>
 
+                <button
+                  type="button"
+                  onClick={() => {
+                    setTab('simulator');
+                    void handleAnalyze({
+                      agent: agents[0]?.name ?? 'AgentSafe demo agent',
+                      tool: 'database.delete_user',
+                      environment: 'production',
+                      argumentsText: '{"user_id":"demo-user"}',
+                    });
+                  }}
+                  className="mb-4 rounded-md bg-rose-700 px-3 py-2 text-sm font-medium text-white hover:bg-rose-800"
+                >
+                  Run live block demo
+                </button>
+
+                <DataState label="recent actions" loading={actionsLoading} error={actionsError} empty={actions?.length === 0} />
                 <div className="overflow-hidden rounded-xl border border-stone-200">
                   <table className="min-w-full text-left text-sm">
                     <thead className="bg-stone-100 text-stone-600">
@@ -720,7 +743,7 @@ function App() {
                     <tbody>
                       {actions?.map((item) => (
                         <tr key={item.id} className="border-t border-stone-200 text-stone-700">
-                          <td className="px-4 py-3">{new Date(item.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</td>
+                          <td className="px-4 py-3" title={new Date(/(?:Z|[+-]\d{2}:\d{2})$/i.test(item.timestamp) ? item.timestamp : `${item.timestamp}Z`).toLocaleString()}>{formatLocalTime(item.timestamp)}</td>
                           <td className="px-4 py-3">{item.agent_name}</td>
                           <td className="px-4 py-3">{item.tool_name}</td>
                           <td className="px-4 py-3">
@@ -768,6 +791,8 @@ function App() {
         )}
 
         {tab === 'agents' && (
+          <>
+          <DataState label="agents" loading={agentsLoading} error={agentsError} empty={agents.length === 0} />
           <section className="grid gap-4 md:grid-cols-3">
             {agents.map((agent) => (
               <div key={agent.id} className="rounded-2xl border border-stone-200 bg-white p-5 shadow-[0_8px_22px_rgba(15,23,42,0.04)]">
@@ -776,20 +801,15 @@ function App() {
                   <span className="rounded-full bg-emerald-100 px-2 py-1 text-xs font-medium text-emerald-700">{agent.status}</span>
                 </div>
                 <p className="mb-4 text-sm text-stone-500">{agent.description}</p>
-                <div className="flex justify-between text-sm text-stone-600">
-                  <span>Actions today</span>
-                  <strong>12</strong>
-                </div>
-                <div className="mt-2 flex justify-between text-sm text-stone-600">
-                  <span>Risk events</span>
-                  <strong>2</strong>
-                </div>
               </div>
             ))}
           </section>
+          </>
         )}
 
         {tab === 'tools' && (
+          <>
+          <DataState label="tools" loading={toolsLoading} error={toolsError} empty={tools.length === 0} />
           <section className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
             {tools.map((tool) => (
               <div key={tool.id} className="rounded-2xl border border-stone-200 bg-white p-5 shadow-[0_8px_22px_rgba(15,23,42,0.04)]">
@@ -805,9 +825,12 @@ function App() {
               </div>
             ))}
           </section>
+          </>
         )}
 
         {tab === 'policies' && (
+          <>
+          <DataState label="policies" loading={policiesLoading} error={policiesError} empty={policies.length === 0} />
           <section className="grid gap-4 md:grid-cols-2">
             {policies.map((policy) => (
               <div key={policy.id} className="rounded-2xl border border-stone-200 bg-white p-5 shadow-[0_8px_22px_rgba(15,23,42,0.04)]">
@@ -822,11 +845,23 @@ function App() {
               </div>
             ))}
           </section>
+          </>
         )}
 
         {tab === 'approvals' && (
           <section className="space-y-4">
-            {approvalRows.map((approval) => (
+            <DataState label="approvals" loading={approvalsLoading} error={approvalsError} empty={approvals.length === 0} />
+            {approvalMutation.isError && (
+              <p role="alert" className="rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-700">
+                {approvalMutation.error.message}. The approval queue will refresh and you can retry.
+              </p>
+            )}
+            {!approvalsLoading && approvals.length === 0 && (
+              <p className="rounded-lg border border-stone-200 bg-white p-5 text-sm text-stone-600">
+                No approvals are waiting for review.
+              </p>
+            )}
+            {approvals.map((approval) => (
               <div key={approval.id} className="rounded-2xl border border-stone-200 bg-white p-5 shadow-[0_8px_22px_rgba(15,23,42,0.04)]">
                 <div className="mb-3 flex items-center justify-between">
                   <div>
@@ -843,13 +878,15 @@ function App() {
                 {approval.status === 'pending' && (
                   <div className="mt-4 flex gap-3">
                     <button
-                      onClick={() => handleApprovalDecision(approval.id, 'approved')}
+                      disabled={approvalMutation.isPending}
+                      onClick={() => handleApprovalDecision(approval.id, 'approve')}
                       className="rounded-xl bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-emerald-500"
                     >
                       Give green light
                     </button>
                     <button
-                      onClick={() => handleApprovalDecision(approval.id, 'denied')}
+                      disabled={approvalMutation.isPending}
+                      onClick={() => handleApprovalDecision(approval.id, 'deny')}
                       className="rounded-xl bg-rose-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-rose-500"
                     >
                       Red light
@@ -873,9 +910,8 @@ function App() {
                     value={simulator.agent}
                     onChange={(e) => setSimulator({ ...simulator, agent: e.target.value })}
                   >
-                    <option value="support-agent">Support Agent</option>
-                    <option value="research-agent">Research Agent</option>
-                    <option value="deployment-agent">Deployment Agent</option>
+                    <option value="">Select an agent</option>
+                    {agents.map((agent) => <option key={agent.id} value={agent.name}>{agent.name}</option>)}
                   </select>
                 </label>
 
@@ -886,14 +922,8 @@ function App() {
                     value={simulator.tool}
                     onChange={(e) => setSimulator({ ...simulator, tool: e.target.value })}
                   >
-                    <option value="web.search">web.search</option>
-                    <option value="read_file">read_file</option>
-                    <option value="database.read">database.read</option>
-                    <option value="database.write">database.write</option>
-                    <option value="database.delete_user">database.delete_user</option>
-                    <option value="send_email">send_email</option>
-                    <option value="deploy">deploy</option>
-                    <option value="send_money">send_money</option>
+                    <option value="">Select a tool</option>
+                    {tools.map((tool) => <option key={tool.id} value={tool.name}>{tool.name}</option>)}
                   </select>
                 </label>
 
@@ -919,8 +949,10 @@ function App() {
                   />
                 </label>
 
+                {analysisError && <p role="alert" className="text-sm text-rose-700">{analysisError}. Check the JSON arguments and API connection.</p>}
                 <button
-                  onClick={handleAnalyze}
+                  disabled={!simulator.agent || !simulator.tool}
+                  onClick={() => void handleAnalyze()}
                   className="w-full rounded-xl bg-stone-900 px-4 py-3 font-medium text-white transition hover:bg-stone-700"
                 >
                   Analyze Action
@@ -939,6 +971,11 @@ function App() {
                     <span className={`rounded-full px-2 py-1 text-xs ${decisionClasses[result.decision] ?? 'bg-stone-100 text-stone-700'}`}>
                       {result.decision}
                     </span>
+                  </div>
+
+                  <div role="status" className={`mb-4 rounded-lg border p-4 ${result.decision === 'BLOCK' ? 'border-rose-300 bg-rose-50 text-rose-900' : result.decision === 'REQUIRE_APPROVAL' ? 'border-amber-300 bg-amber-50 text-amber-900' : 'border-emerald-300 bg-emerald-50 text-emerald-900'}`}>
+                    <div className="font-semibold">{result.decision === 'BLOCK' ? 'ACTION BLOCKED BEFORE TOOL EXECUTION' : result.decision === 'REQUIRE_APPROVAL' ? 'ACTION PAUSED FOR HUMAN APPROVAL' : 'ACTION ALLOWED BY POLICY'}</div>
+                    <p className="mt-1 text-sm">{result.decision === 'BLOCK' ? 'The policy engine denied this tool call. The tool was not run; the agent must stop this action.' : result.decision === 'REQUIRE_APPROVAL' ? 'No tool was run. The agent must wait for an approval decision.' : 'The policy engine allowed this action. This dashboard demo does not execute external tools.'}</p>
                   </div>
 
                   <div className="mb-4 grid gap-3 sm:grid-cols-2">

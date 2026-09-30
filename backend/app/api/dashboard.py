@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.action import Action
+from app.models.approval import Approval
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -13,7 +14,7 @@ def dashboard_stats(db: Session = Depends(get_db)):
     total = db.query(Action).count()
     allowed = db.query(Action).filter(Action.decision == "ALLOW").count()
     blocked = db.query(Action).filter(Action.decision == "BLOCK").count()
-    pending = db.query(Action).filter(Action.decision == "REQUIRE_APPROVAL").count()
+    pending = db.query(Approval).filter(Approval.status == "pending").count()
     return {
         "total_actions": total,
         "allowed": allowed,

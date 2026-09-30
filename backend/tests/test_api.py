@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from fastapi.testclient import TestClient
 
 from app.main import app
@@ -39,6 +41,35 @@ def test_actions_check_endpoint_blocks_critical_risk():
     assert data["decision"] == "BLOCK"
 
 
+def test_action_and_approval_timestamps_are_aware_utc():
+    response = client.post(
+        "/api/actions/check",
+        json={
+            "agent": "timezone-test-agent",
+            "tool": "deploy",
+            "arguments": {"service": "test"},
+            "environment": "production",
+        },
+    )
+    assert response.status_code == 200
+
+    action = next(
+        item for item in client.get("/api/actions").json()
+        if item["agent_name"] == "timezone-test-agent"
+    )
+    action_time = datetime.fromisoformat(action["timestamp"])
+    assert action_time.tzinfo is not None
+    assert action_time.utcoffset() == timezone.utc.utcoffset(action_time)
+
+    approval = next(
+        item for item in client.get("/api/approvals").json()
+        if item["action_id"] == action["id"]
+    )
+    approval_time = datetime.fromisoformat(approval["created_at"])
+    assert approval_time.tzinfo is not None
+    assert approval_time.utcoffset() == timezone.utc.utcoffset(approval_time)
+
+
 def test_actions_check_endpoint_approval_for_deploy():
     payload = {"agent": "deployment-agent", "tool": "deploy", "arguments": {"service": "api"}, "environment": "production"}
     response = client.post("/api/actions/check", json=payload)
@@ -72,3 +103,35 @@ def test_approvals_endpoint_returns_data():
     response = client.get("/api/approvals")
     assert response.status_code == 200
     assert isinstance(response.json(), list)
+
+
+def test_approval_decision_persists_and_updates_pending_count():
+    pending_before = client.get("/api/dashboard/stats").json()["pending_approval"]
+    action_response = client.post(
+        "/api/actions/check",
+        json={
+            "agent": "approval-persistence-test",
+            "tool": "deploy",
+            "arguments": {"service": "api"},
+            "environment": "production",
+        },
+    )
+    assert action_response.status_code == 200
+    assert action_response.json()["requires_approval"] is True
+
+    approvals = client.get("/api/approvals").json()
+    approval = max(
+        (item for item in approvals if item["agent_name"] == "approval-persistence-test"),
+        key=lambda item: item["id"],
+    )
+    decision_response = client.post(f"/api/approvals/{approval['id']}/approve")
+
+    assert decision_response.status_code == 200
+    assert decision_response.json()["status"] == "approved"
+    assert client.get("/api/dashboard/stats").json()["pending_approval"] == pending_before
+    assert client.post(f"/api/approvals/{approval['id']}/deny").status_code == 409
+
+    actions = client.get("/api/actions").json()
+    action = next(item for item in actions if item["id"] == approval["action_id"])
+    assert action["approval_status"] == "approved"
+    assert action["execution_status"] == "approved"
